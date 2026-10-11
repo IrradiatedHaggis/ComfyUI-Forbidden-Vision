@@ -9,8 +9,7 @@ import kornia
 from .face_detector import ForbiddenVisionFaceDetector
 from .mask_processor import ForbiddenVisionMaskProcessor
 from .face_processor_integrated import ForbiddenVisionFaceProcessorIntegrated
-from .utils import check_for_interruption, ensure_model_directories, get_ordered_upscaler_model_list, clean_model_name
-
+from .utils import check_for_interruption, ensure_model_directories, get_ordered_upscaler_model_list, clean_model_name, load_upscale_model_spandrel, run_upscale_model, ensure_rgb
 
 
 class ForbiddenVisionFaceEditPrep:
@@ -102,31 +101,10 @@ class ForbiddenVisionFaceEditPrep:
             return True
 
         try:
-            model_path = folder_paths.get_full_path("upscale_models", clean_model_name_val)
-            if model_path is None:
-                print(f"Upscaler model '{clean_model_name_val}' not found.")
-                return False
-
-            from basicsr.utils import img2tensor, tensor2img
-            from realesrgan import RealESRGANer
-
-            device = model_management.get_torch_device()
-            upsampler = RealESRGANer(
-                model_path=model_path,
-                scale=4,
-                model=None,
-                tile=0,
-                tile_pad=10,
-                pre_pad=0,
-                half=not model_management.is_device_mps(device),
-                device=device,
-            )
-
-            self.upscaler_model = upsampler
+            self.upscaler_model = load_upscale_model_spandrel(clean_model_name_val)
             self.upscaler_model_name = clean_model_name_val
             print(f"Loaded upscaler model: {clean_model_name_val}")
             return True
-
         except Exception as e:
             print(f"Error loading upscaler model '{clean_model_name_val}': {e}")
             self.upscaler_model = None
@@ -219,9 +197,7 @@ class ForbiddenVisionFaceEditPrep:
             return image_np_uint8
 
         try:
-            upsampler = self.upscaler_model
-            output, _ = upsampler.enhance(image_np_uint8, outscale=1)
-            return output
+            return run_upscale_model(self.upscaler_model, image_np_uint8)
         except Exception as e:
             print(f"Error running upscaler '{self.upscaler_model_name}': {e}")
             return image_np_uint8
@@ -249,7 +225,7 @@ class ForbiddenVisionFaceEditPrep:
                     "detection_angle": 0,
                 }
                 return (empty_face, empty_mask, empty_info)
-
+            image = ensure_rgb(image)
             device = image.device
             h, w = image.shape[1], image.shape[2]
 
@@ -379,6 +355,9 @@ class ForbiddenVisionFaceEditMerge:
 
             if original_image is None or edited_face is None or face_info is None:
                 return (original_image, torch.zeros_like(original_image[:, :, :, 0]))
+
+            original_image = ensure_rgb(original_image)
+            edited_face = ensure_rgb(edited_face)
 
             if isinstance(face_info, (list, tuple)) and face_info and isinstance(face_info[0], dict):
                 restore_info_list = [face_info[0]]

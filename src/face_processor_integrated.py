@@ -14,7 +14,7 @@ import kornia
 import re
 from .face_detector import ForbiddenVisionFaceDetector
 from .mask_processor import ForbiddenVisionMaskProcessor
-from .utils import check_for_interruption, get_ordered_upscaler_model_list, ensure_model_directories, clean_model_name
+from .utils import check_for_interruption, get_ordered_upscaler_model_list, ensure_model_directories, clean_model_name, load_upscale_model_spandrel, run_upscale_model
 
 class ExclusionProcessor:
     def process(self, text, exclusions):
@@ -178,7 +178,7 @@ class ForbiddenVisionFaceProcessorIntegrated:
 
     def load_upscaler_model(self, model_name):
         clean_model_name_val = clean_model_name(model_name)
-        
+
         if clean_model_name_val in ["Fast 4x (Bicubic AA)", "Fast 4x (Lanczos)", "Fast 2x (Bicubic AA)", "Fast 2x (Lanczos)"]:
             self.upscaler_model = None
             self.upscaler_model_name = clean_model_name_val
@@ -188,24 +188,12 @@ class ForbiddenVisionFaceProcessorIntegrated:
             return True
 
         try:
-            model_path = folder_paths.get_full_path("upscale_models", clean_model_name_val)
-            if model_path is None:
-                print(f"Upscaler model '{clean_model_name_val}' not found.")
-                return False
-            
-            UpscalerLoaderClass = nodes.NODE_CLASS_MAPPINGS['UpscaleModelLoader']
-            upscaler_loader = UpscalerLoaderClass()
-            
-            self.upscaler_model = upscaler_loader.load_model(clean_model_name_val)[0]
+            self.upscaler_model = load_upscale_model_spandrel(clean_model_name_val)
             self.upscaler_model_name = clean_model_name_val
-            
+            print(f"Loaded upscaler model: {clean_model_name_val}")
             return True
-            
         except model_management.InterruptProcessingException:
             raise
-        except KeyError:
-            print("Error: Could not find 'UpscaleModelLoader' in nodes.NODE_CLASS_MAPPINGS.")
-            return False
         except Exception as e:
             print(f"An error occurred loading upscaler model {clean_model_name_val}: {e}")
             self.upscaler_model = None
@@ -232,28 +220,10 @@ class ForbiddenVisionFaceProcessorIntegrated:
     def run_ai_upscaler(self, image_np_uint8):
         if self.upscaler_model is None:
             return image_np_uint8
-        
-        image_tensor = torch.from_numpy(image_np_uint8.astype(np.float32) / 255.0).unsqueeze(0)
-        
         try:
-            ImageUpscalerClass = nodes.NODE_CLASS_MAPPINGS['ImageUpscaleWithModel']
-            upscaler_node = ImageUpscalerClass()
-
-            with torch.no_grad():
-                upscaled_tensor = upscaler_node.upscale(
-                    upscale_model=self.upscaler_model,
-                    image=image_tensor
-                )[0]
-            
-            upscaled_np = upscaled_tensor.squeeze(0).cpu().numpy()
-            upscaled_np_uint8 = (np.clip(upscaled_np, 0, 1) * 255.0).astype(np.uint8)
-            return upscaled_np_uint8
-
+            return run_upscale_model(self.upscaler_model, image_np_uint8)
         except model_management.InterruptProcessingException:
             raise
-        except KeyError:
-            print("Error: Could not find 'ImageUpscaleWithModel' in nodes.NODE_CLASS_MAPPINGS.")
-            return image_np_uint8
         except Exception as e:
             print(f"Error during upscaling process: {e}. Falling back to standard resize.")
             return image_np_uint8
@@ -579,6 +549,12 @@ class ForbiddenVisionFaceProcessorIntegrated:
 
             if input_image.dim() == 3:
                 input_image = input_image.unsqueeze(0)
+
+            # Drop alpha / expand grayscale so the whole pipeline is RGB
+            if input_image.shape[-1] == 4:
+                input_image = input_image[..., :3]
+            elif input_image.shape[-1] == 1:
+                input_image = input_image.repeat(1, 1, 1, 3)
 
             common = dict(
                 model=model, vae=vae, positive=positive, negative=negative,

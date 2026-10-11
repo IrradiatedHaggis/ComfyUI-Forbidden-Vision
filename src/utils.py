@@ -4,9 +4,48 @@ import numpy as np
 import cv2
 import folder_paths
 import yaml
+import comfy.utils
 import comfy.model_management as model_management
 # === Latent shape helpers (SD 4D / Qwen-Image-Anima 5D dual mode) ===
 
+
+def load_upscale_model_spandrel(model_name):
+    from spandrel import ModelLoader, ImageModelDescriptor
+    path = folder_paths.get_full_path("upscale_models", model_name)
+    if path is None:
+        raise FileNotFoundError(f"Upscaler model '{model_name}' not found.")
+    sd = comfy.utils.load_torch_file(path, safe_load=True)
+    if "module.layers.0.residual_group.blocks.0.norm1.weight" in sd:
+        sd = comfy.utils.state_dict_prefix_replace(sd, {"module.": ""})
+    model = ModelLoader().load_from_state_dict(sd).eval()
+    if not isinstance(model, ImageModelDescriptor):
+        raise TypeError("Upscale model must be a single-image model.")
+    return model
+
+@torch.no_grad()
+def run_upscale_model(upscale_model, image_np_uint8):
+    device = model_management.get_torch_device()
+    img = torch.from_numpy(image_np_uint8.astype(np.float32) / 255.0)
+    img = img.unsqueeze(0).movedim(-1, 1).to(device)  # BHWC -> BCHW
+    upscale_model.to(device)
+    try:
+        tile, overlap = 512, 32
+        while True:
+            try:
+                out = comfy.utils.tiled_scale(
+                    img, lambda a: upscale_model(a),
+                    tile_x=tile, tile_y=tile, overlap=overlap,
+                    upscale_amount=upscale_model.scale,
+                )
+                break
+            except model_management.OOM_EXCEPTION:
+                tile //= 2
+                if tile < 128:
+                    raise
+    finally:
+        upscale_model.to("cpu")
+    out = torch.clamp(out.movedim(1, -1), 0.0, 1.0)[0]
+    return (out.cpu().numpy() * 255.0).round().astype(np.uint8)
 def latent_is_5d(latent_tensor):
     """True if latent has a temporal dim (Qwen-Image VAE / Anima / Cosmos)."""
     return latent_tensor.dim() == 5
@@ -26,13 +65,12 @@ def normalize_vae_decode_output(image_out):
     """
     5D VAE output (Qwen-Image / Wan / Anima) -> 4D [B, H, W, C].
     Batch and temporal axes are folded together, matching Comfy's VAEDecode.
+    Always returns 3-channel RGB.
     """
     if image_out.dim() == 5:
         if image_out.shape[-1] in (1, 3, 4):
-            # [B, T, H, W, C] or [1, B*T, H, W, C]
             image_out = image_out.reshape(-1, *image_out.shape[-3:])
         elif image_out.shape[1] in (1, 3, 4):
-            # channels-first [B, C, T, H, W]
             image_out = image_out.permute(0, 2, 3, 4, 1).contiguous()
             image_out = image_out.reshape(-1, *image_out.shape[-3:])
         else:
@@ -41,9 +79,31 @@ def normalize_vae_decode_output(image_out):
     if image_out.dim() != 4:
         raise ValueError(f"Expected 4D image tensor, got {tuple(image_out.shape)}")
 
+    # --- NEW: force RGB ---
+    c = image_out.shape[-1]
+    if c == 4:
+        image_out = image_out[..., :3]          # drop alpha (RGBA VAEs)
+    elif c == 1:
+        image_out = image_out.repeat(1, 1, 1, 3)  # grayscale -> RGB
+    elif c != 3:
+        raise ValueError(f"Unsupported VAE output channel count: {c}")
+
+    # Range detection only on RGB, so alpha can't skew it
     mins = image_out.amin(dim=(1, 2, 3), keepdim=True)
     image_out = torch.where(mins < -0.5, (image_out + 1.0) / 2.0, image_out)
     return torch.clamp(image_out, 0.0, 1.0)
+def ensure_rgb(image):
+    """Force an IMAGE tensor [B, H, W, C] to 3-channel RGB."""
+    if image is None:
+        return None
+    if image.dim() == 3:
+        image = image.unsqueeze(0)
+    c = image.shape[-1]
+    if c == 4:
+        return image[..., :3]
+    if c == 1:
+        return image.repeat(1, 1, 1, 3)
+    return image
 def detect_model_latent_layout(model, vae=None):
     """
     Returns (channels, is_temporal) for the given model.
